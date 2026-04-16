@@ -1,11 +1,11 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: ASCEND_RT_VISIBLE_DEVICES=14 uv run train.py
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
@@ -14,16 +14,15 @@ import time
 from dataclasses import dataclass, asdict
 
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+torch.npu.set_device(0)
+device = torch.device("npu:0")
+print("NPU is available:", torch.npu.is_available())
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -37,7 +36,7 @@ class GPTConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    window_pattern: str = "SSSL"
+    window_pattern: str = "LLLL"
 
 
 def norm(x):
@@ -90,7 +89,8 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # slide window is not supported
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -302,18 +302,18 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    dtype = p.dtype    
+    p.mul_((1 - lr_t * wd_t).to(dtype))
+    exp_avg.lerp_(grad, (1 - beta1_t).to(dtype))
+    exp_avg_sq.lerp_(grad.square(), (1 - beta2_t).to(dtype))
+    bias1 = (1 - beta1_t ** step_t).to(dtype)
+    bias2 = (1 - beta2_t ** step_t).to(dtype)
+    denom = (exp_avg_sq / bias2).sqrt() + eps_t.to(dtype)
+    step_size = (lr_t / bias1).to(dtype)
+    update = (exp_avg / denom) * step_size
+    p.sub_(update)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -335,22 +335,28 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    buf_dtype = second_momentum_buffer.dtype
+    beta2 = beta2_t.to(buf_dtype)
+    
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(v_mean.to(buf_dtype), 1 - beta2)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    param_dtype = stacked_params.dtype
+    g_fp = g.to(param_dtype)
+    lr = lr_t.to(param_dtype)
+    wd = wd_t.to(param_dtype)
+    mask = (g_fp * stacked_params) >= 0
+    mask = mask.to(param_dtype)
+    update = lr * g_fp + (lr * wd) * stacked_params * mask
+    stacked_params.sub_(update)
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -359,16 +365,16 @@ class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=device)
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=device)
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -432,7 +438,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "LLLL" # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -448,7 +454,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,11 +462,10 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+torch.npu.manual_seed(42)
+autocast_ctx = torch.amp.autocast(device_type="npu", dtype=torch.bfloat16)
+# H100_BF16_PEAK_FLOPS = 989.5e12
+ASCEND_910C_BF16_PEAK_FLOPS = 780e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -479,8 +484,8 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
+# with torch.device("meta"):
+model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -505,7 +510,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+# without torch.compile
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -541,7 +546,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    torch.npu.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -571,7 +576,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    torch.npu.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -584,7 +589,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / ASCEND_910C_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,8 +620,8 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / ASCEND_910C_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+peak_vram_mb = torch.npu.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

@@ -3,7 +3,7 @@ name = "autoresearch"
 version = "0.1.0"
 description = "Autonomous pretraining research swarm"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
@@ -13,15 +13,14 @@ dependencies = [
     "requests>=2.32.0",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "torch==2.9.0",
+    "torch-npu==2.9.0",
 ]
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu128" },
+  { url = "https://download.pytorch.org/whl/cpu/torch-2.9.0%2Bcpu-cp310-cp310-manylinux_2_28_aarch64.whl" }
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+torch-npu = [
+  { url = "https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.9.0/torch_npu-2.9.0-cp310-cp310-manylinux_2_28_aarch64.whl" }
+]
