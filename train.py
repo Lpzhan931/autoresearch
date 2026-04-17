@@ -36,7 +36,7 @@ class GPTConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    window_pattern: str = "LLLL"
+    window_pattern: str = "SSSL"
 
 
 def norm(x):
@@ -73,6 +73,10 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
+        self.register_buffer("mask", None, persistent=False)
+        self.cached_seq_len = 0
+        self.cached_window_size = -1
+
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
@@ -89,9 +93,27 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        # slide window is not supported
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.contiguous().view(B, T, -1)
+        q = q.transpose(1, 2)   # (B, T, H, D) to (B, H, T, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        win_len = window_size[0]
+
+        if win_len < 0 or win_len >= T:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            if self.cached_seq_len != T or self.cached_window_size != win_len:
+                mask = torch.ones(T, T, dtype=torch.bool, device=x.device)
+                mask = torch.tril(mask)
+                mask = torch.triu(mask, diagonal=-win_len + 1)
+                mask = mask.view(1, 1, T, T) 
+                
+                self.register_buffer("mask", mask, persistent=False)
+                self.cached_seq_len = T
+                self.cached_window_size = win_len            
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask, is_causal=False)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -438,7 +460,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "LLLL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -484,8 +506,8 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-# with torch.device("meta"):
-model = GPT(config)
+with torch.device("meta"):
+    model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -592,7 +614,7 @@ while True:
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / ASCEND_910C_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu (compare to 910C): {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
