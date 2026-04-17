@@ -1,7 +1,7 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: ASCEND_RT_VISIBLE_DEVICES=14 uv run train.py
+Usage: uv run train.py
 """
 
 import os
